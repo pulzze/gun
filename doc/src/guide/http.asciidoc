@@ -1,7 +1,7 @@
 == HTTP
 
 This chapter describes how to use the Gun client for
-communicating with an HTTP/1.1 or SPDY server.
+communicating with an HTTP/1.1 or HTTP/2 server.
 
 === Streams
 
@@ -45,7 +45,7 @@ handling of responses will be explained further on.
 
 ==== GET and HEAD
 
-Use `gun:get/{2,3}` to request a resource.
+Use `gun:get/{2,3,4}` to request a resource.
 
 .GET "/organizations/ninenines"
 
@@ -64,7 +64,7 @@ Note that the list of headers has the field name as a binary.
 The field value is iodata, which is either a binary or an
 iolist.
 
-Use `gun:head/{2,3}` if you don't need the response body.
+Use `gun:head/{2,3,4}` if you don't need the response body.
 
 .HEAD "/organizations/ninenines"
 
@@ -101,7 +101,7 @@ desirable. The request body of a PATCH method may be a partial
 representation or a list of instructions on how to update the
 resource.
 
-The `gun:post/4`, `gun:put/4` and `gun:patch/4` functions
+The `gun:post/{4,5}`, `gun:put/{4,5}` and `gun:patch/{4,5}` functions
 take a body as their fourth argument. These functions do
 not require any body-specific header to be set, although
 it is always recommended to set the content-type header.
@@ -130,7 +130,7 @@ the request has no body.
 It is recommended to send the content-length header if you
 know it in advance, although this is not required. If it
 is not set, HTTP/1.1 will use the chunked transfer-encoding,
-and SPDY will continue normally as it is chunked by design.
+and HTTP/2 will continue normally as it is chunked by design.
 
 .POST "/organizations/ninenines" with delayed body
 
@@ -171,7 +171,7 @@ do_sendfile(ConnPid, StreamRef, IoDevice) ->
 
 ==== DELETE
 
-Use `gun:delete/{2,3}` to delete a resource.
+Use `gun:delete/{2,3,4}` to delete a resource.
 
 .DELETE "/organizations/ninenines"
 
@@ -211,7 +211,7 @@ StreamRef = gun:options(ConnPid, "*").
 
 ==== Requests with an arbitrary method
 
-The `gun:request/{4,5}` function can be used to send requests
+The `gun:request/{4,5,6}` function can be used to send requests
 with a configurable method name. It is mostly useful when you
 need a method that Gun does not understand natively.
 
@@ -234,7 +234,7 @@ data messages following. If it contains `fin` there will be
 no data messages. If it contains `nofin` then one or more data
 messages will follow.
 
-When using SPDY this value is sent with the frame and simply
+When using HTTP/2 this value is sent with the frame and simply
 passed on in the message. When using HTTP/1.1 however Gun must
 guess whether data will follow by looking at the response headers.
 
@@ -309,7 +309,7 @@ end.
 
 === Handling streams pushed by the server
 
-The SPDY protocol allows the server to push more than one
+The HTTP/2 protocol allows the server to push more than one
 resource for every request. It will start sending those
 extra resources before it starts sending the response itself,
 so Gun will send you `gun_push` messages before `gun_response`
@@ -360,3 +360,14 @@ gun:flush(ConnPid).
 
 [source,erlang]
 gun:flush(StreamRef).
+
+=== Redirecting responses to a different process
+
+Gun allows you to specify which process will handle responses
+to a request via the `reply_to` request option.
+
+.GET "/organizations/ninenines" to a different process
+
+[source,erlang]
+StreamRef = gun:get(ConnPid, "/organizations/ninenines", [],
+	#{reply_to => Pid}).

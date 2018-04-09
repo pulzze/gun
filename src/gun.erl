@@ -17,26 +17,36 @@
 %% Connection.
 -export([open/2]).
 -export([open/3]).
+-export([open_unix/2]).
+-export([info/1]).
 -export([close/1]).
 -export([shutdown/1]).
 
 %% Requests.
 -export([delete/2]).
 -export([delete/3]).
+-export([delete/4]).
 -export([get/2]).
 -export([get/3]).
+-export([get/4]).
 -export([head/2]).
 -export([head/3]).
+-export([head/4]).
 -export([options/2]).
 -export([options/3]).
+-export([options/4]).
 -export([patch/3]).
 -export([patch/4]).
+-export([patch/5]).
 -export([post/3]).
 -export([post/4]).
+-export([post/5]).
 -export([put/3]).
 -export([put/4]).
+-export([put/5]).
 -export([request/4]).
 -export([request/5]).
+-export([request/6]).
 
 %% Streaming data.
 -export([data/4]).
@@ -69,7 +79,7 @@
 
 %% Internals.
 -export([start_link/4]).
--export([init/5]).
+-export([proc_lib_hack/5]).
 -export([system_continue/3]).
 -export([system_terminate/4]).
 -export([system_code_change/4]).
@@ -83,6 +93,10 @@
 
 -type opts() :: map().
 -export_type([opts/0]).
+%% @todo Add an option to disable/enable the notowner behavior.
+
+-type req_opts() :: map().
+-export_type([req_opts/0]).
 
 -type http_opts() :: map().
 -export_type([http_opts/0]).
@@ -90,23 +104,23 @@
 -type http2_opts() :: map().
 -export_type([http2_opts/0]).
 
--type spdy_opts() :: map().
--export_type([spdy_opts/0]).
-
+%% @todo keepalive
 -type ws_opts() :: map().
 -export_type([ws_opts/0]).
 
 -record(state, {
 	parent :: pid(),
 	owner :: pid(),
+	owner_ref :: reference(),
 	host :: inet:hostname(),
 	port :: inet:port_number(),
 	opts :: opts(),
-	keepalive_ref :: reference(),
-	socket :: inet:socket() | ssl:sslsocket(),
+	keepalive_ref :: undefined | reference(),
+	socket :: undefined | inet:socket() | ssl:sslsocket(),
 	transport :: module(),
 	protocol :: module(),
-	protocol_state :: any()
+	protocol_state :: any(),
+	last_error :: any()
 }).
 
 %% Connection.
@@ -119,6 +133,14 @@ open(Host, Port) ->
 -spec open(inet:hostname(), inet:port_number(), opts())
 	-> {ok, pid()} | {error, any()}.
 open(Host, Port, Opts) when is_list(Host); is_atom(Host) ->
+	do_open(Host, Port, Opts).
+
+-spec open_unix(Path::string(), opts())
+	-> {ok, pid()} | {error, any()}.
+open_unix(SocketPath, Opts) ->
+	do_open({local, SocketPath}, 0, Opts).
+
+do_open(Host, Port, Opts) ->
 	case check_options(maps:to_list(Opts)) of
 		ok ->
 			case supervisor:start_child(gun_sup, [self(), Host, Port, Opts]) of
@@ -134,6 +156,10 @@ open(Host, Port, Opts) when is_list(Host); is_atom(Host) ->
 
 check_options([]) ->
 	ok;
+check_options([{connect_timeout, infinity}|Opts]) ->
+	check_options(Opts);
+check_options([{connect_timeout, T}|Opts]) when is_integer(T), T >= 0 ->
+	check_options(Opts);
 check_options([{http_opts, ProtoOpts}|Opts]) when is_map(ProtoOpts) ->
 	case gun_http:check_options(ProtoOpts) of
 		ok ->
@@ -152,7 +178,7 @@ check_options([Opt = {protocols, L}|Opts]) when is_list(L) ->
 	Len = length(L),
 	case length(lists:usort(L)) of
 		Len when Len > 0 ->
-			Check = lists:usort([(P =:= http) orelse (P =:= http2) orelse (P =:= spdy) || P <- L]),
+			Check = lists:usort([(P =:= http) orelse (P =:= http2) || P <- L]),
 			case Check of
 				[true] ->
 					check_options(Opts);
@@ -164,15 +190,8 @@ check_options([Opt = {protocols, L}|Opts]) when is_list(L) ->
 	end;
 check_options([{retry, R}|Opts]) when is_integer(R), R >= 0 ->
 	check_options(Opts);
-check_options([{retry_timeout, T}|Opts]) when is_integer(T) > 0 ->
+check_options([{retry_timeout, T}|Opts]) when is_integer(T), T >= 0 ->
 	check_options(Opts);
-check_options([{spdy_opts, ProtoOpts}|Opts]) when is_map(ProtoOpts) ->
-	case gun_spdy:check_options(ProtoOpts) of
-		ok ->
-			check_options(Opts);
-		Error ->
-			Error
-	end;
 check_options([{trace, B}|Opts]) when B =:= true; B =:= false ->
 	check_options(Opts);
 check_options([{transport, T}|Opts]) when T =:= tcp; T =:= ssl ->
@@ -195,11 +214,16 @@ consider_tracing(ServerPid, #{trace := true}) ->
 	dbg:tpl(gun, [{'_', [], [{return_trace}]}]),
 	dbg:tpl(gun_http, [{'_', [], [{return_trace}]}]),
 	dbg:tpl(gun_http2, [{'_', [], [{return_trace}]}]),
-	dbg:tpl(gun_spdy, [{'_', [], [{return_trace}]}]),
 	dbg:tpl(gun_ws, [{'_', [], [{return_trace}]}]),
 	dbg:p(ServerPid, all);
 consider_tracing(_, _) ->
 	ok.
+
+-spec info(pid()) -> map().
+info(ServerPid) ->
+	{_, #state{socket=Socket, transport=Transport}} = sys:get_state(ServerPid),
+	{ok, {SockIP, SockPort}} = Transport:sockname(Socket),
+	#{sock_ip => SockIP, sock_port => SockPort}.
 
 -spec close(pid()) -> ok.
 close(ServerPid) ->
@@ -220,6 +244,10 @@ delete(ServerPid, Path) ->
 delete(ServerPid, Path, Headers) ->
 	request(ServerPid, <<"DELETE">>, Path, Headers).
 
+-spec delete(pid(), iodata(), headers(), req_opts()) -> reference().
+delete(ServerPid, Path, Headers, ReqOpts) ->
+	request(ServerPid, <<"DELETE">>, Path, Headers, <<>>, ReqOpts).
+
 -spec get(pid(), iodata()) -> reference().
 get(ServerPid, Path) ->
 	request(ServerPid, <<"GET">>, Path, []).
@@ -227,6 +255,10 @@ get(ServerPid, Path) ->
 -spec get(pid(), iodata(), headers()) -> reference().
 get(ServerPid, Path, Headers) ->
 	request(ServerPid, <<"GET">>, Path, Headers).
+
+-spec get(pid(), iodata(), headers(), req_opts()) -> reference().
+get(ServerPid, Path, Headers, ReqOpts) ->
+	request(ServerPid, <<"GET">>, Path, Headers, <<>>, ReqOpts).
 
 -spec head(pid(), iodata()) -> reference().
 head(ServerPid, Path) ->
@@ -236,6 +268,10 @@ head(ServerPid, Path) ->
 head(ServerPid, Path, Headers) ->
 	request(ServerPid, <<"HEAD">>, Path, Headers).
 
+-spec head(pid(), iodata(), headers(), req_opts()) -> reference().
+head(ServerPid, Path, Headers, ReqOpts) ->
+	request(ServerPid, <<"HEAD">>, Path, Headers, <<>>, ReqOpts).
+
 -spec options(pid(), iodata()) -> reference().
 options(ServerPid, Path) ->
 	request(ServerPid, <<"OPTIONS">>, Path, []).
@@ -243,6 +279,10 @@ options(ServerPid, Path) ->
 -spec options(pid(), iodata(), headers()) -> reference().
 options(ServerPid, Path, Headers) ->
 	request(ServerPid, <<"OPTIONS">>, Path, Headers).
+
+-spec options(pid(), iodata(), headers(), req_opts()) -> reference().
+options(ServerPid, Path, Headers, ReqOpts) ->
+	request(ServerPid, <<"OPTIONS">>, Path, Headers, <<>>, ReqOpts).
 
 -spec patch(pid(), iodata(), headers()) -> reference().
 patch(ServerPid, Path, Headers) ->
@@ -252,6 +292,10 @@ patch(ServerPid, Path, Headers) ->
 patch(ServerPid, Path, Headers, Body) ->
 	request(ServerPid, <<"PATCH">>, Path, Headers, Body).
 
+-spec patch(pid(), iodata(), headers(), iodata(), req_opts()) -> reference().
+patch(ServerPid, Path, Headers, Body, ReqOpts) ->
+	request(ServerPid, <<"PATCH">>, Path, Headers, Body, ReqOpts).
+
 -spec post(pid(), iodata(), headers()) -> reference().
 post(ServerPid, Path, Headers) ->
 	request(ServerPid, <<"POST">>, Path, Headers).
@@ -259,6 +303,10 @@ post(ServerPid, Path, Headers) ->
 -spec post(pid(), iodata(), headers(), iodata()) -> reference().
 post(ServerPid, Path, Headers, Body) ->
 	request(ServerPid, <<"POST">>, Path, Headers, Body).
+
+-spec post(pid(), iodata(), headers(), iodata(), req_opts()) -> reference().
+post(ServerPid, Path, Headers, Body, ReqOpts) ->
+	request(ServerPid, <<"POST">>, Path, Headers, Body, ReqOpts).
 
 -spec put(pid(), iodata(), headers()) -> reference().
 put(ServerPid, Path, Headers) ->
@@ -268,16 +316,23 @@ put(ServerPid, Path, Headers) ->
 put(ServerPid, Path, Headers, Body) ->
 	request(ServerPid, <<"PUT">>, Path, Headers, Body).
 
+-spec put(pid(), iodata(), headers(), iodata(), req_opts()) -> reference().
+put(ServerPid, Path, Headers, Body, ReqOpts) ->
+	request(ServerPid, <<"PUT">>, Path, Headers, Body, ReqOpts).
+
 -spec request(pid(), iodata(), iodata(), headers()) -> reference().
 request(ServerPid, Method, Path, Headers) ->
-	StreamRef = make_ref(),
-	_ = ServerPid ! {request, self(), StreamRef, Method, Path, Headers},
-	StreamRef.
+	request(ServerPid, Method, Path, Headers, <<>>, #{}).
 
 -spec request(pid(), iodata(), iodata(), headers(), iodata()) -> reference().
 request(ServerPid, Method, Path, Headers, Body) ->
+	request(ServerPid, Method, Path, Headers, Body, #{}).
+
+-spec request(pid(), iodata(), iodata(), headers(), iodata(), req_opts()) -> reference().
+request(ServerPid, Method, Path, Headers, Body, ReqOpts) ->
 	StreamRef = make_ref(),
-	_ = ServerPid ! {request, self(), StreamRef, Method, Path, Headers, Body},
+	ReplyTo = maps:get(reply_to, ReqOpts, self()),
+	_ = ServerPid ! {request, ReplyTo, StreamRef, Method, Path, Headers, Body},
 	StreamRef.
 
 %% Streaming data.
@@ -288,6 +343,8 @@ data(ServerPid, StreamRef, IsFin, Data) ->
 	ok.
 
 %% Awaiting gun messages.
+
+%% @todo spec await await_body
 
 await(ServerPid, StreamRef) ->
 	MRef = monitor(process, ServerPid),
@@ -305,10 +362,14 @@ await(ServerPid, StreamRef, Timeout) ->
 
 await(ServerPid, StreamRef, Timeout, MRef) ->
 	receive
+		{gun_inform, ServerPid, StreamRef, Status, Headers} ->
+			{inform, Status, Headers};
 		{gun_response, ServerPid, StreamRef, IsFin, Status, Headers} ->
 			{response, IsFin, Status, Headers};
 		{gun_data, ServerPid, StreamRef, IsFin, Data} ->
 			{data, IsFin, Data};
+		{gun_trailers, ServerPid, StreamRef, Trailers} ->
+			{trailers, Trailers};
 		{gun_push, ServerPid, StreamRef, NewStreamRef, Method, URI, Headers} ->
 			{push, NewStreamRef, Method, URI, Headers};
 		{gun_error, ServerPid, StreamRef, Reason} ->
@@ -345,6 +406,10 @@ await_body(ServerPid, StreamRef, Timeout, MRef, Acc) ->
 				<< Acc/binary, Data/binary >>);
 		{gun_data, ServerPid, StreamRef, fin, Data} ->
 			{ok, << Acc/binary, Data/binary >>};
+		%% It's OK to return trailers here because the client
+		%% specifically requested them.
+		{gun_trailers, ServerPid, StreamRef, Trailers} ->
+			{ok, Acc, Trailers};
 		{gun_error, ServerPid, StreamRef, Reason} ->
 			{error, Reason};
 		{gun_error, ServerPid, Reason} ->
@@ -355,14 +420,14 @@ await_body(ServerPid, StreamRef, Timeout, MRef, Acc) ->
 		{error, timeout}
 	end.
 
--spec await_up(pid()) -> {ok, http | http2 | spdy} | {error, atom()}.
+-spec await_up(pid()) -> {ok, http | http2} | {error, atom()}.
 await_up(ServerPid) ->
 	MRef = monitor(process, ServerPid),
 	Res = await_up(ServerPid, 5000, MRef),
 	demonitor(MRef, [flush]),
 	Res.
 
--spec await_up(pid(), reference() | timeout()) -> {ok, http | http2 | spdy} | {error, atom()}.
+-spec await_up(pid(), reference() | timeout()) -> {ok, http | http2} | {error, atom()}.
 await_up(ServerPid, MRef) when is_reference(MRef) ->
 	await_up(ServerPid, 5000, MRef);
 await_up(ServerPid, Timeout) ->
@@ -371,7 +436,7 @@ await_up(ServerPid, Timeout) ->
 	demonitor(MRef, [flush]),
 	Res.
 
--spec await_up(pid(), timeout(), reference()) -> {ok, http | http2 | spdy} | {error, atom()}.
+-spec await_up(pid(), timeout(), reference()) -> {ok, http | http2} | {error, atom()}.
 await_up(ServerPid, Timeout, MRef) ->
 	receive
 		{gun_up, ServerPid, Protocol} ->
@@ -393,6 +458,8 @@ flush_pid(ServerPid) ->
 		{gun_up, ServerPid, _} ->
 			flush_pid(ServerPid);
 		{gun_down, ServerPid, _, _, _, _} ->
+			flush_pid(ServerPid);
+		{gun_inform, ServerPid, _, _, _} ->
 			flush_pid(ServerPid);
 		{gun_response, ServerPid, _, _, _, _} ->
 			flush_pid(ServerPid);
@@ -416,6 +483,8 @@ flush_pid(ServerPid) ->
 
 flush_ref(StreamRef) ->
 	receive
+		{gun_inform, _, StreamRef, _, _} ->
+			flush_pid(StreamRef);
 		{gun_response, _, StreamRef, _, _, _} ->
 			flush_ref(StreamRef);
 		{gun_data, _, StreamRef, _, _} ->
@@ -472,8 +541,18 @@ dbg_send_raw(ServerPid, Data) ->
 %% Internals.
 
 start_link(Owner, Host, Port, Opts) ->
-	proc_lib:start_link(?MODULE, init,
+	proc_lib:start_link(?MODULE, proc_lib_hack,
 		[self(), Owner, Host, Port, Opts]).
+
+proc_lib_hack(Parent, Owner, Host, Port, Opts) ->
+	try
+		init(Parent, Owner, Host, Port, Opts)
+	catch
+		_:normal -> exit(normal);
+		_:shutdown -> exit(shutdown);
+		_:Reason = {shutdown, _} -> exit(Reason);
+		_:Reason -> exit({Reason, erlang:get_stacktrace()})
+	end.
 
 init(Parent, Owner, Host, Port, Opts) ->
 	ok = proc_lib:init_ack(Parent, {ok, self()}),
@@ -482,45 +561,44 @@ init(Parent, Owner, Host, Port, Opts) ->
 		tcp -> ranch_tcp;
 		ssl -> ranch_ssl
 	end,
-	connect(#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts, transport=Transport}, Retry).
+	OwnerRef = monitor(process, Owner),
+	connect(#state{parent=Parent, owner=Owner, owner_ref=OwnerRef,
+		host=Host, port=Port, opts=Opts, transport=Transport}, Retry).
 
 default_transport(443) -> ssl;
 default_transport(_) -> tcp.
 
 connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport=ranch_ssl}, Retries) ->
-	Protocols = lists:flatten([case P of
+	Protocols = [case P of
 		http -> <<"http/1.1">>;
-		http2 -> <<"h2">>;
-		spdy -> [<<"spdy/3.1">>, <<"spdy/3">>]
-	end || P <- maps:get(protocols, Opts, [http2, spdy, http])]),
+		http2 -> <<"h2">>
+	end || P <- maps:get(protocols, Opts, [http2, http])],
 	TransportOpts = [binary, {active, false},
 		{alpn_advertised_protocols, Protocols},
 		{client_preferred_next_protocols, {client, Protocols, <<"http/1.1">>}}
 		|maps:get(transport_opts, Opts, [])],
-	case Transport:connect(Host, Port, TransportOpts) of
+	case Transport:connect(Host, Port, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
 		{ok, Socket} ->
 			{Protocol, ProtoOptsKey} = case ssl:negotiated_protocol(Socket) of
 				{ok, <<"h2">>} -> {gun_http2, http2_opts};
-				{ok, <<"spdy/3", _/bits>>} -> {gun_spdy, spdy_opts};
 				_ -> {gun_http, http_opts}
 			end,
 			up(State, Socket, Protocol, ProtoOptsKey);
-		{error, _} ->
-			retry(State, Retries - 1)
+		{error, Reason} ->
+			retry(State#state{last_error=Reason}, Retries)
 	end;
 connect(State=#state{host=Host, port=Port, opts=Opts, transport=Transport}, Retries) ->
 	TransportOpts = [binary, {active, false}
 		|maps:get(transport_opts, Opts, [])],
-	case Transport:connect(Host, Port, TransportOpts) of
+	case Transport:connect(Host, Port, TransportOpts, maps:get(connect_timeout, Opts, infinity)) of
 		{ok, Socket} ->
 			{Protocol, ProtoOptsKey} = case maps:get(protocols, Opts, [http]) of
 				[http] -> {gun_http, http_opts};
-				[http2] -> {gun_http2, http2_opts};
-				[spdy] -> {gun_spdy, spdy_opts}
+				[http2] -> {gun_http2, http2_opts}
 			end,
 			up(State, Socket, Protocol, ProtoOptsKey);
-		{error, _} ->
-			retry(State, Retries - 1)
+		{error, Reason} ->
+			retry(State#state{last_error=Reason}, Retries)
 	end.
 
 up(State=#state{owner=Owner, opts=Opts, transport=Transport}, Socket, Protocol, ProtoOptsKey) ->
@@ -532,12 +610,11 @@ up(State=#state{owner=Owner, opts=Opts, transport=Transport}, Socket, Protocol, 
 down(State=#state{owner=Owner, opts=Opts, protocol=Protocol, protocol_state=ProtoState}, Reason) ->
 	{KilledStreams, UnprocessedStreams} = Protocol:down(ProtoState),
 	Owner ! {gun_down, self(), Protocol:name(), Reason, KilledStreams, UnprocessedStreams},
-	retry(State#state{socket=undefined, protocol=undefined, protocol_state=undefined},
-		maps:get(retry, Opts, 5)).
+	retry(State#state{socket=undefined, protocol=undefined, protocol_state=undefined,
+		last_error=Reason}, maps:get(retry, Opts, 5)).
 
-%% Exit normally if the retry functionality has been disabled.
-retry(_, 0) ->
-	ok;
+retry(#state{last_error=Reason}, 0) ->
+	exit({shutdown, Reason});
 retry(State=#state{keepalive_ref=KeepaliveRef}, Retries) when is_reference(KeepaliveRef) ->
 	_ = erlang:cancel_timer(KeepaliveRef),
 	%% Flush if we have a keepalive message
@@ -546,13 +623,10 @@ retry(State=#state{keepalive_ref=KeepaliveRef}, Retries) when is_reference(Keepa
 	after 0 ->
 		ok
 	end,
-	retry_loop(State#state{keepalive_ref=undefined}, Retries);
+	retry_loop(State#state{keepalive_ref=undefined}, Retries - 1);
 retry(State, Retries) ->
-	retry_loop(State, Retries).
+	retry_loop(State, Retries - 1).
 
-%% Too many retries, give up.
-retry_loop(_, 0) ->
-	error(gone);
 retry_loop(State=#state{parent=Parent, opts=Opts}, Retries) ->
 	_ = erlang:send_after(maps:get(retry_timeout, Opts, 5000), self(), retry),
 	receive
@@ -567,15 +641,17 @@ before_loop(State=#state{opts=Opts, protocol=Protocol}) ->
 	%% @todo Might not be worth checking every time?
 	ProtoOptsKey = case Protocol of
 		gun_http -> http_opts;
-		gun_http2 -> http2_opts;
-		gun_spdy -> spdy_opts
+		gun_http2 -> http2_opts
 	end,
 	ProtoOpts = maps:get(ProtoOptsKey, Opts, #{}),
 	Keepalive = maps:get(keepalive, ProtoOpts, 5000),
-	KeepaliveRef = erlang:send_after(Keepalive, self(), keepalive),
+	KeepaliveRef = case Keepalive of
+		infinity -> undefined;
+		_ -> erlang:send_after(Keepalive, self(), keepalive)
+	end,
 	loop(State#state{keepalive_ref=KeepaliveRef}).
 
-loop(State=#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts,
+loop(State=#state{parent=Parent, owner=Owner, owner_ref=OwnerRef, host=Host, port=Port, opts=Opts,
 		socket=Socket, transport=Transport, protocol=Protocol, protocol_state=ProtoState}) ->
 	{OK, Closed, Error} = Transport:messages(),
 	Transport:setopts(Socket, [{active, once}]),
@@ -607,20 +683,22 @@ loop(State=#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts,
 		keepalive ->
 			ProtoState2 = Protocol:keepalive(ProtoState),
 			before_loop(State#state{protocol_state=ProtoState2});
-		{request, Owner, StreamRef, Method, Path, Headers} ->
+		{request, ReplyTo, StreamRef, Method, Path, Headers, <<>>} ->
 			ProtoState2 = Protocol:request(ProtoState,
-				StreamRef, Method, Host, Port, Path, Headers),
+				StreamRef, ReplyTo, Method, Host, Port, Path, Headers),
 			loop(State#state{protocol_state=ProtoState2});
-		{request, Owner, StreamRef, Method, Path, Headers, Body} ->
+		{request, ReplyTo, StreamRef, Method, Path, Headers, Body} ->
 			ProtoState2 = Protocol:request(ProtoState,
-				StreamRef, Method, Host, Port, Path, Headers, Body),
+				StreamRef, ReplyTo, Method, Host, Port, Path, Headers, Body),
 			loop(State#state{protocol_state=ProtoState2});
-		{data, Owner, StreamRef, IsFin, Data} ->
+		%% @todo Do we want to reject ReplyTo if it's not the process
+		%% who initiated the connection? For both data and cancel.
+		{data, ReplyTo, StreamRef, IsFin, Data} ->
 			ProtoState2 = Protocol:data(ProtoState,
-				StreamRef, IsFin, Data),
+				StreamRef, ReplyTo, IsFin, Data),
 			loop(State#state{protocol_state=ProtoState2});
-		{cancel, Owner, StreamRef} ->
-			ProtoState2 = Protocol:cancel(ProtoState, StreamRef),
+		{cancel, ReplyTo, StreamRef} ->
+			ProtoState2 = Protocol:cancel(ProtoState, StreamRef, ReplyTo),
 			loop(State#state{protocol_state=ProtoState2});
 		%% @todo Maybe make an interface in the protocol module instead of checking on protocol name.
 		%% An interface would also make sure that HTTP/1.0 can't upgrade.
@@ -635,6 +713,10 @@ loop(State=#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts,
 		{shutdown, Owner} ->
 			%% @todo Protocol:shutdown?
 			ok;
+		{'DOWN', OwnerRef, process, Owner, Reason} ->
+			Protocol:close(ProtoState),
+			Transport:close(Socket),
+			owner_gone(Reason);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
 				{loop, State});
@@ -654,6 +736,8 @@ loop(State=#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts,
 				"Connection needs to be upgraded to Websocket "
 				"before the gun:ws_send/1 function can be used."}},
 			loop(State);
+		%% @todo The ReplyTo patch disabled the notowner behavior.
+		%% We need to add an option to enforce this behavior if needed.
 		Any when is_tuple(Any), is_pid(element(2, Any)) ->
 			element(2, Any) ! {gun_error, self(), {notowner,
 				"Operations are restricted to the owner of the connection."}},
@@ -663,10 +747,10 @@ loop(State=#state{parent=Parent, owner=Owner, host=Host, port=Port, opts=Opts,
 			loop(State)
 	end.
 
-ws_loop(State=#state{parent=Parent, owner=Owner, socket=Socket,
+ws_loop(State=#state{parent=Parent, owner=Owner, owner_ref=OwnerRef, socket=Socket,
 		transport=Transport, protocol=Protocol, protocol_state=ProtoState}) ->
 	{OK, Closed, Error} = Transport:messages(),
-	ok = Transport:setopts(Socket, [{active, once}]),
+	Transport:setopts(Socket, [{active, once}]),
 	receive
 		{OK, Socket, Data} ->
 			case Protocol:handle(Data, ProtoState) of
@@ -698,6 +782,10 @@ ws_loop(State=#state{parent=Parent, owner=Owner, socket=Socket,
 		{shutdown, Owner} ->
 			%% @todo Protocol:shutdown? %% @todo close frame
 			ok;
+		{'DOWN', OwnerRef, process, Owner, Reason} ->
+			Protocol:close(owner_gone, ProtoState),
+			Transport:close(Socket),
+			owner_gone(Reason);
 		{system, From, Request} ->
 			sys:handle_system_msg(Request, From, Parent, ?MODULE, [],
 				{ws_loop, State});
@@ -708,6 +796,12 @@ ws_loop(State=#state{parent=Parent, owner=Owner, socket=Socket,
 		Any ->
 			error_logger:error_msg("Unexpected message: ~w~n", [Any])
 	end.
+
+-spec owner_gone(_) -> no_return().
+owner_gone(normal) -> exit(normal);
+owner_gone(shutdown) -> exit(shutdown);
+owner_gone(Shutdown = {shutdown, _}) -> exit(Shutdown);
+owner_gone(Reason) -> error({owner_gone, Reason}).
 
 system_continue(_, _, {retry_loop, State, Retry}) ->
 	retry_loop(State, Retry);

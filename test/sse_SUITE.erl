@@ -1,4 +1,4 @@
-%% Copyright (c) 2013-2015, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2017, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -12,7 +12,7 @@
 %% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 %% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
--module(twitter_SUITE).
+-module(sse_SUITE).
 -compile(export_all).
 -compile(nowarn_export_all).
 
@@ -20,33 +20,41 @@ all() ->
 	[http, http2].
 
 http(_) ->
-	{ok, Pid} = gun:open("twitter.com", 443, #{protocols => [http]}),
+	{ok, Pid} = gun:open("sse.now.sh", 443, #{
+		protocols => [http],
+		http_opts => #{content_handlers => [gun_sse, gun_data]}
+	}),
 	{ok, http} = gun:await_up(Pid),
 	common(Pid).
 
 http2(_) ->
-	{ok, Pid} = gun:open("twitter.com", 443, #{protocols => [http2]}),
+	{ok, Pid} = gun:open("sse.now.sh", 443, #{
+		protocols => [http2],
+		http2_opts => #{content_handlers => [gun_sse, gun_data]}
+	}),
 	{ok, http2} = gun:await_up(Pid),
 	common(Pid).
 
 common(Pid) ->
-	Ref = gun:get(Pid, "/"),
+	Ref = gun:get(Pid, "/", [
+		{<<"host">>, <<"sse.now.sh">>},
+		{<<"accept">>, <<"text/event-stream">>}
+	]),
 	receive
 		{gun_response, Pid, Ref, nofin, Status, Headers} ->
 			ct:print("response ~p ~p", [Status, Headers]),
-			data_loop(Pid, Ref)
+			event_loop(Pid, Ref, 3)
 	after 5000 ->
 		error(timeout)
 	end.
 
-data_loop(Pid, Ref) ->
+event_loop(_, _, 0) ->
+	ok;
+event_loop(Pid, Ref, N) ->
 	receive
-		{gun_data, Pid, Ref, nofin, Data} ->
-			ct:print("data ~p", [Data]),
-			data_loop(Pid, Ref);
-		{gun_data, Pid, Ref, fin, Data} ->
-			gun:close(Pid),
-			ct:print("data ~p~nend", [Data])
-	after 5000 ->
+		{gun_sse, Pid, Ref, Event} ->
+			ct:print("event ~p", [Event]),
+			event_loop(Pid, Ref, N - 1)
+	after 10000 ->
 		error(timeout)
 	end.

@@ -20,29 +20,39 @@
 -export([handle/2]).
 -export([close/1]).
 -export([keepalive/1]).
--export([request/7]).
 -export([request/8]).
--export([data/4]).
--export([cancel/2]).
+-export([request/9]).
+-export([data/5]).
+-export([cancel/3]).
 -export([down/1]).
 -export([ws_upgrade/7]).
 
--type io() :: head | {body, non_neg_integer()} | body_close | body_chunked.
+-type io() :: head | {body, non_neg_integer()} | body_close | body_chunked | body_trailer.
 
--type websocket_info() :: {websocket, reference(), binary(), [binary()], [], gun:ws_opts()}. %% key, extensions, protocols, options
+%% @todo Make that a record.
+-type websocket_info() :: {websocket, reference(), binary(), [binary()], gun:ws_opts()}. %% key, extensions, options
+
+-record(stream, {
+	ref :: reference() | websocket_info(),
+	reply_to :: pid(),
+	method :: binary(),
+	is_alive :: boolean(),
+	handler_state :: undefined | gun_content_handler:state()
+}).
 
 -record(http_state, {
 	owner :: pid(),
 	socket :: inet:socket() | ssl:sslsocket(),
 	transport :: module(),
 	version = 'HTTP/1.1' :: cow_http:version(),
+	content_handlers :: gun_content_handler:opt(),
 	connection = keepalive :: keepalive | close,
 	buffer = <<>> :: binary(),
-	%% Stream reference, request method and whether the stream is alive.
-	streams = [] :: [{reference() | websocket_info(), binary(), boolean()}],
+	streams = [] :: [#stream{}],
 	in = head :: io(),
-	in_state :: {non_neg_integer(), non_neg_integer()},
-	out = head :: io()
+	in_state = {0, 0} :: {non_neg_integer(), non_neg_integer()},
+	out = head :: io(),
+	transform_header_name :: fun((binary()) -> binary())
 }).
 
 check_options(Opts) ->
@@ -50,9 +60,18 @@ check_options(Opts) ->
 
 do_check_options([]) ->
 	ok;
+do_check_options([{keepalive, infinity}|Opts]) ->
+	do_check_options(Opts);
 do_check_options([{keepalive, K}|Opts]) when is_integer(K), K > 0 ->
 	do_check_options(Opts);
 do_check_options([{version, V}|Opts]) when V =:= 'HTTP/1.1'; V =:= 'HTTP/1.0' ->
+	do_check_options(Opts);
+do_check_options([Opt={content_handlers, Handlers}|Opts]) ->
+	case gun_content_handler:check_option(Handlers) of
+		ok -> do_check_options(Opts);
+		error -> {error, {options, {http, Opt}}}
+	end;
+do_check_options([{transform_header_name, F}|Opts]) when is_function(F) ->
 	do_check_options(Opts);
 do_check_options([Opt|_]) ->
 	{error, {options, {http, Opt}}}.
@@ -61,7 +80,10 @@ name() -> http.
 
 init(Owner, Socket, Transport, Opts) ->
 	Version = maps:get(version, Opts, 'HTTP/1.1'),
-	#http_state{owner=Owner, socket=Socket, transport=Transport, version=Version}.
+	Handlers = maps:get(content_handlers, Opts, [gun_data]),
+	TransformHeaderName = maps:get(transform_header_name, Opts, fun (N) -> N end),
+	#http_state{owner=Owner, socket=Socket, transport=Transport, version=Version,
+		content_handlers=Handlers, transform_header_name=TransformHeaderName}.
 
 %% Stop looping when we got no more data.
 handle(<<>>, State) ->
@@ -72,14 +94,14 @@ handle(_, #http_state{streams=[]}) ->
 %% Wait for the full response headers before trying to parse them.
 handle(Data, State=#http_state{in=head, buffer=Buffer}) ->
 	Data2 = << Buffer/binary, Data/binary >>,
-	case binary:match(Data, <<"\r\n\r\n">>) of
+	case binary:match(Data2, <<"\r\n\r\n">>) of
 		nomatch -> State#http_state{buffer=Data2};
 		{_, _} -> handle_head(Data2, State#http_state{buffer= <<>>})
 	end;
 %% Everything sent to the socket until it closes is part of the response body.
 handle(Data, State=#http_state{in=body_close}) ->
-	send_data_if_alive(Data, State, nofin),
-	State;
+	send_data_if_alive(Data, State, nofin);
+%% Chunked transfer-encoding may contain both data and trailers.
 handle(Data, State=#http_state{in=body_chunked, in_state=InState,
 		buffer=Buffer, connection=Conn}) ->
 	Buffer2 = << Buffer/binary, Data/binary >>,
@@ -87,27 +109,58 @@ handle(Data, State=#http_state{in=body_chunked, in_state=InState,
 		more ->
 			State#http_state{buffer=Buffer2};
 		{more, Data2, InState2} ->
-			send_data_if_alive(Data2, State, nofin),
-			State#http_state{buffer= <<>>, in_state=InState2};
+			send_data_if_alive(Data2,
+				State#http_state{buffer= <<>>, in_state=InState2},
+				nofin);
 		{more, Data2, Length, InState2} when is_integer(Length) ->
 			%% @todo See if we can recv faster than one message at a time.
-			send_data_if_alive(Data2, State, nofin),
-			State#http_state{buffer= <<>>, in_state=InState2};
+			send_data_if_alive(Data2,
+				State#http_state{buffer= <<>>, in_state=InState2},
+				nofin);
 		{more, Data2, Rest, InState2} ->
 			%% @todo See if we can recv faster than one message at a time.
-			send_data_if_alive(Data2, State, nofin),
-			State#http_state{buffer=Rest, in_state=InState2};
-		{done, _TotalLength, Rest} ->
+			send_data_if_alive(Data2,
+				State#http_state{buffer=Rest, in_state=InState2},
+				nofin);
+		{done, HasTrailers, Rest} ->
+			IsFin = case HasTrailers of
+				trailers -> nofin;
+				no_trailers -> fin
+			end,
 			%% I suppose it doesn't hurt to append an empty binary.
-			send_data_if_alive(<<>>, State, fin),
-			case Conn of
-				keepalive ->
-					handle(Rest, end_stream(State#http_state{buffer= <<>>}));
-				close ->
+			State1 = send_data_if_alive(<<>>, State, IsFin),
+			case {HasTrailers, Conn} of
+				{trailers, _} ->
+					handle(Rest, State1#http_state{buffer = <<>>, in=body_trailer});
+				{no_trailers, keepalive} ->
+					handle(Rest, end_stream(State1#http_state{buffer= <<>>}));
+				{no_trailers, close} ->
 					close
 			end;
-		{done, Data2, _TotalLength, Rest} ->
-			send_data_if_alive(Data2, State, fin),
+		{done, Data2, HasTrailers, Rest} ->
+			IsFin = case HasTrailers of
+				trailers -> nofin;
+				no_trailers -> fin
+			end,
+			State1 = send_data_if_alive(Data2, State, IsFin),
+			case {HasTrailers, Conn} of
+				{trailers, _} ->
+					handle(Rest, State1#http_state{buffer = <<>>, in=body_trailer});
+				{no_trailers, keepalive} ->
+					handle(Rest, end_stream(State1#http_state{buffer= <<>>}));
+				{no_trailers, close} ->
+					close
+			end
+	end;
+handle(Data, State=#http_state{in=body_trailer, buffer=Buffer, connection=Conn,
+		streams=[#stream{ref=StreamRef, reply_to=ReplyTo}|_]}) ->
+	Data2 = << Buffer/binary, Data/binary >>,
+	case binary:match(Data2, <<"\r\n\r\n">>) of
+		nomatch -> State#http_state{buffer=Data2};
+		{_, _} ->
+			{Trailers, Rest} = cow_http:parse_headers(Data2),
+			%% @todo We probably want to pass this to gun_content_handler?
+			ReplyTo ! {gun_trailers, self(), stream_ref(StreamRef), Trailers},
 			case Conn of
 				keepalive ->
 					handle(Rest, end_stream(State#http_state{buffer= <<>>}));
@@ -121,46 +174,53 @@ handle(Data, State=#http_state{in={body, Length}, connection=Conn}) ->
 	if
 		%% More data coming.
 		DataSize < Length ->
-			send_data_if_alive(Data, State, nofin),
-			State#http_state{in={body, Length - DataSize}};
+			send_data_if_alive(Data,
+				State#http_state{in={body, Length - DataSize}},
+				nofin);
 		%% Stream finished, no rest.
 		DataSize =:= Length ->
-			send_data_if_alive(Data, State, fin),
+			State1 = send_data_if_alive(Data, State, fin),
 			case Conn of
-				keepalive -> end_stream(State);
+				keepalive -> end_stream(State1);
 				close -> close
 			end;
 		%% Stream finished, rest.
 		true ->
 			<< Body:Length/binary, Rest/bits >> = Data,
-			send_data_if_alive(Body, State, fin),
+			State1 = send_data_if_alive(Body, State, fin),
 			case Conn of
-				keepalive -> handle(Rest, end_stream(State));
+				keepalive -> handle(Rest, end_stream(State1));
 				close -> close
 			end
 	end.
 
-handle_head(Data, State=#http_state{owner=Owner, version=ClientVersion,
-		connection=Conn, streams=[{StreamRef, Method, IsAlive}|_]}) ->
+handle_head(Data, State=#http_state{version=ClientVersion,
+		content_handlers=Handlers0, connection=Conn,
+		streams=[Stream=#stream{ref=StreamRef, reply_to=ReplyTo,
+			method=Method, is_alive=IsAlive}|Tail]}) ->
 	{Version, Status, _, Rest} = cow_http:parse_status_line(Data),
 	{Headers, Rest2} = cow_http:parse_headers(Rest),
 	case {Status, StreamRef} of
-		{101, {websocket, _, WsKey, WsExtensions, WsProtocols, WsOpts}} ->
-			ws_handshake(Rest2, State, Headers, WsKey, WsExtensions, WsProtocols, WsOpts);
+		{101, {websocket, _, WsKey, WsExtensions, WsOpts}} ->
+			ws_handshake(Rest2, State, Headers, WsKey, WsExtensions, WsOpts);
+		{_, _} when Status >= 100, Status =< 199 ->
+			ReplyTo ! {gun_inform, self(), stream_ref(StreamRef), Status, Headers},
+			handle(Rest2, State);
 		_ ->
 			In = response_io_from_headers(Method, Version, Status, Headers),
 			IsFin = case In of head -> fin; _ -> nofin end,
-			case IsAlive of
+			Handlers = case IsAlive of
 				false ->
 					ok;
 				true ->
-					StreamRef2 = case StreamRef of
-						{websocket, SR, _, _, _, _} -> SR;
-						_ -> StreamRef
-					end,
-					Owner ! {gun_response, self(), StreamRef2,
+					ReplyTo ! {gun_response, self(), stream_ref(StreamRef),
 						IsFin, Status, Headers},
-					ok
+					case IsFin of
+						fin -> undefined;
+						nofin ->
+							gun_content_handler:init(ReplyTo, StreamRef,
+								Status, Headers, Handlers0)
+					end
 			end,
 			Conn2 = if
 				Conn =:= close -> close;
@@ -174,36 +234,42 @@ handle_head(Data, State=#http_state{owner=Owner, version=ClientVersion,
 					close;
 				IsFin =:= fin ->
 					handle(Rest2, end_stream(State#http_state{in=In,
-						in_state={0, 0}, connection=Conn2}));
+						in_state={0, 0}, connection=Conn2,
+						streams=[Stream#stream{handler_state=Handlers}|Tail]}));
 				true ->
-					handle(Rest2, State#http_state{in=In, in_state={0, 0}, connection=Conn2})
+					handle(Rest2, State#http_state{in=In,
+						in_state={0, 0}, connection=Conn2,
+						streams=[Stream#stream{handler_state=Handlers}|Tail]})
 			end
 	end.
 
-send_data_if_alive(<<>>, _, nofin) ->
-	ok;
+stream_ref({websocket, StreamRef, _, _, _}) -> StreamRef;
+stream_ref(StreamRef) -> StreamRef.
+
+send_data_if_alive(<<>>, State, nofin) ->
+	State;
 %% @todo What if we receive data when the HEAD method was used?
-send_data_if_alive(Data, #http_state{owner=Owner,
-		streams=[{StreamRef, _, true}|_]}, IsFin) ->
-	Owner ! {gun_data, self(), StreamRef, IsFin, Data},
-	ok;
-send_data_if_alive(_, _, _) ->
-	ok.
+send_data_if_alive(Data, State=#http_state{streams=[Stream=#stream{
+		is_alive=true, handler_state=Handlers0}|Tail]}, IsFin) ->
+	Handlers = gun_content_handler:handle(IsFin, Data, Handlers0),
+	State#http_state{streams=[Stream#stream{handler_state=Handlers}|Tail]};
+send_data_if_alive(_, State, _) ->
+	State.
 
-close(State=#http_state{in=body_close, owner=Owner, streams=[_|Tail]}) ->
-	send_data_if_alive(<<>>, State, fin),
-	close_streams(Owner, Tail);
-close(#http_state{owner=Owner, streams=Streams}) ->
-	close_streams(Owner, Streams).
+close(State=#http_state{in=body_close, streams=[_|Tail]}) ->
+	_ = send_data_if_alive(<<>>, State, fin),
+	close_streams(Tail);
+close(#http_state{streams=Streams}) ->
+	close_streams(Streams).
 
-close_streams(_, []) ->
+close_streams([]) ->
 	ok;
-close_streams(Owner, [{_, _, false}|Tail]) ->
-	close_streams(Owner, Tail);
-close_streams(Owner, [{StreamRef, _, _}|Tail]) ->
-	Owner ! {gun_error, self(), StreamRef, {closed,
+close_streams([#stream{is_alive=false}|Tail]) ->
+	close_streams(Tail);
+close_streams([#stream{ref=StreamRef, reply_to=ReplyTo}|Tail]) ->
+	ReplyTo ! {gun_error, self(), StreamRef, {closed,
 		"The connection was lost."}},
-	close_streams(Owner, Tail).
+	close_streams(Tail).
 
 %% We can only keep-alive by sending an empty line in-between streams.
 keepalive(State=#http_state{socket=Socket, transport=Transport, out=head}) ->
@@ -213,7 +279,7 @@ keepalive(State) ->
 	State.
 
 request(State=#http_state{socket=Socket, transport=Transport, version=Version,
-		out=head}, StreamRef, Method, Host, Port, Path, Headers) ->
+		out=head}, StreamRef, ReplyTo, Method, Host, Port, Path, Headers) ->
 	Headers2 = lists:keydelete(<<"transfer-encoding">>, 1, Headers),
 	Headers3 = case lists:keymember(<<"host">>, 1, Headers) of
 		false -> [{<<"host">>, [Host, $:, integer_to_binary(Port)]}|Headers2];
@@ -223,40 +289,46 @@ request(State=#http_state{socket=Socket, transport=Transport, version=Version,
 	Conn = conn_from_headers(Version, Headers2),
 	Out = request_io_from_headers(Headers2),
 	Headers4 = case Out of
+		body_chunked when Version =:= 'HTTP/1.0' -> Headers3;
 		body_chunked -> [{<<"transfer-encoding">>, <<"chunked">>}|Headers3];
 		_ -> Headers3
 	end,
-	Transport:send(Socket, cow_http:request(Method, Path, Version, Headers4)),
-	new_stream(State#http_state{connection=Conn, out=Out}, StreamRef, Method).
+	Headers5 = transform_header_names(State, Headers4),
+	Transport:send(Socket, cow_http:request(Method, Path, Version, Headers5)),
+	new_stream(State#http_state{connection=Conn, out=Out}, StreamRef, ReplyTo, Method).
 
 request(State=#http_state{socket=Socket, transport=Transport, version=Version,
-		out=head}, StreamRef, Method, Host, Port, Path, Headers, Body) ->
+		out=head}, StreamRef, ReplyTo, Method, Host, Port, Path, Headers, Body) ->
 	Headers2 = lists:keydelete(<<"content-length">>, 1,
 		lists:keydelete(<<"transfer-encoding">>, 1, Headers)),
 	Headers3 = case lists:keymember(<<"host">>, 1, Headers) of
 		false -> [{<<"host">>, [Host, $:, integer_to_binary(Port)]}|Headers2];
 		true -> Headers2
 	end,
+	Headers4 = transform_header_names(State, Headers3),
 	%% We use Headers2 because this is the smallest list.
 	Conn = conn_from_headers(Version, Headers2),
 	Transport:send(Socket, [
 		cow_http:request(Method, Path, Version, [
 			{<<"content-length">>, integer_to_binary(iolist_size(Body))}
-		|Headers3]),
+		|Headers4]),
 		Body]),
-	new_stream(State#http_state{connection=Conn}, StreamRef, Method).
+	new_stream(State#http_state{connection=Conn}, StreamRef, ReplyTo, Method).
+
+transform_header_names(#http_state{transform_header_name = Fun}, Headers) ->
+	lists:keymap(Fun, 1, Headers).
 
 %% We are expecting a new stream.
-data(State=#http_state{out=head}, StreamRef, _, _) ->
-	error_stream_closed(State, StreamRef);
+data(State=#http_state{out=head}, StreamRef, ReplyTo, _, _) ->
+	error_stream_closed(State, StreamRef, ReplyTo);
 %% There are no active streams.
-data(State=#http_state{streams=[]}, StreamRef, _, _) ->
-	error_stream_not_found(State, StreamRef);
+data(State=#http_state{streams=[]}, StreamRef, ReplyTo, _, _) ->
+	error_stream_not_found(State, StreamRef, ReplyTo);
 %% We can only send data on the last created stream.
 data(State=#http_state{socket=Socket, transport=Transport, version=Version,
-		out=Out, streams=Streams}, StreamRef, IsFin, Data) ->
+		out=Out, streams=Streams}, StreamRef, ReplyTo, IsFin, Data) ->
 	case lists:last(Streams) of
-		{StreamRef, _, true} ->
+		#stream{ref=StreamRef, is_alive=true} ->
 			DataLength = iolist_size(Data),
 			case Out of
 				body_chunked when Version =:= 'HTTP/1.1', IsFin =:= fin ->
@@ -287,33 +359,33 @@ data(State=#http_state{socket=Socket, transport=Transport, version=Version,
 					State
 			end;
 		_ ->
-			error_stream_not_found(State, StreamRef)
+			error_stream_not_found(State, StreamRef, ReplyTo)
 	end.
 
 %% We can't cancel anything, we can just stop forwarding messages to the owner.
-cancel(State, StreamRef) ->
+cancel(State, StreamRef, ReplyTo) ->
 	case is_stream(State, StreamRef) of
 		true ->
 			cancel_stream(State, StreamRef);
 		false ->
-			error_stream_not_found(State, StreamRef)
+			error_stream_not_found(State, StreamRef, ReplyTo)
 	end.
 
 %% HTTP does not provide any way to figure out what streams are unprocessed.
 down(#http_state{streams=Streams}) ->
 	KilledStreams = [case Ref of
-		{websocket, Ref2, _, _, _, _} -> Ref2;
+		{websocket, Ref2, _, _, _} -> Ref2;
 		_ -> Ref
-	end || {Ref, _, _} <- Streams],
+	end || #stream{ref=Ref} <- Streams],
 	{KilledStreams, []}.
 
-error_stream_closed(State=#http_state{owner=Owner}, StreamRef) ->
-	Owner ! {gun_error, self(), StreamRef, {badstate,
+error_stream_closed(State, StreamRef, ReplyTo) ->
+	ReplyTo ! {gun_error, self(), StreamRef, {badstate,
 		"The stream has already been closed."}},
 	State.
 
-error_stream_not_found(State=#http_state{owner=Owner}, StreamRef) ->
-	Owner ! {gun_error, self(), StreamRef, {badstate,
+error_stream_not_found(State, StreamRef, ReplyTo) ->
+	ReplyTo ! {gun_error, self(), StreamRef, {badstate,
 		"The stream cannot be found."}},
 	State.
 
@@ -348,7 +420,7 @@ request_io_from_headers(Headers) ->
 
 response_io_from_headers(<<"HEAD">>, _, _, _) ->
 	head;
-response_io_from_headers(_, _, 204, _) ->
+response_io_from_headers(_, _, Status, _) when (Status =:= 204) or (Status =:= 304) ->
 	head;
 response_io_from_headers(_, Version, _Status, Headers) ->
 	case lists:keyfind(<<"content-length">>, 1, Headers) of
@@ -372,19 +444,21 @@ response_io_from_headers(_, Version, _Status, Headers) ->
 
 %% Streams.
 
-new_stream(State=#http_state{streams=Streams}, StreamRef, Method) ->
-	State#http_state{streams=Streams ++ [{StreamRef, iolist_to_binary(Method), true}]}.
+new_stream(State=#http_state{streams=Streams}, StreamRef, ReplyTo, Method) ->
+	State#http_state{streams=Streams
+		++ [#stream{ref=StreamRef, reply_to=ReplyTo,
+			method=iolist_to_binary(Method), is_alive=true}]}.
 
 is_stream(#http_state{streams=Streams}, StreamRef) ->
-	lists:keymember(StreamRef, 1, Streams).
+	lists:keymember(StreamRef, #stream.ref, Streams).
 
 cancel_stream(State=#http_state{streams=Streams}, StreamRef) ->
 	Streams2 = [case Ref of
 		StreamRef ->
-			{Ref, false};
+			Tuple#stream{is_alive=false};
 		_ ->
 			Tuple
-	end || Tuple = {Ref, _, _} <- Streams],
+	end || Tuple = #stream{ref=Ref} <- Streams],
 	State#http_state{streams=Streams2}.
 
 end_stream(State=#http_state{streams=[_|Tail]}) ->
@@ -395,54 +469,60 @@ end_stream(State=#http_state{streams=[_|Tail]}) ->
 %% Ensure version is 1.1.
 ws_upgrade(#http_state{version='HTTP/1.0'}, _, _, _, _, _, _) ->
 	error; %% @todo
-ws_upgrade(State=#http_state{socket=Socket, transport=Transport, out=head},
-		StreamRef, Host, Port, Path, Headers, WsOpts) ->
+ws_upgrade(State=#http_state{socket=Socket, transport=Transport, owner=Owner, out=head},
+		StreamRef, Host, Port, Path, Headers0, WsOpts) ->
 	{Headers1, GunExtensions} = case maps:get(compress, WsOpts, false) of
 		true -> {[{<<"sec-websocket-extensions">>,
 				<<"permessage-deflate; client_max_window_bits; server_max_window_bits=15">>}
-			|Headers],
+			|Headers0],
 			[<<"permessage-deflate">>]};
-		false -> {Headers, []}
+		false -> {Headers0, []}
+	end,
+	Headers2 = case maps:get(protocols, WsOpts, []) of
+		[] -> Headers1;
+		ProtoOpt ->
+			<< _, _, Proto/bits >> = iolist_to_binary([[<<", ">>, P] || {P, _} <- ProtoOpt]),
+			[{<<"sec-websocket-protocol">>, Proto}|Headers1]
 	end,
 	Key = cow_ws:key(),
-	Headers2 = [
+	Headers3 = [
 		{<<"connection">>, <<"upgrade">>},
 		{<<"upgrade">>, <<"websocket">>},
 		{<<"sec-websocket-version">>, <<"13">>},
 		{<<"sec-websocket-key">>, Key}
-		|Headers1
+		|Headers2
 	],
 	IsSecure = Transport:secure(),
-	Headers3 = case lists:keymember(<<"host">>, 1, Headers) of
-		true -> Headers2;
-		false when Port =:= 80, not IsSecure -> [{<<"host">>, Host}|Headers2];
-		false when Port =:= 443, IsSecure -> [{<<"host">>, Host}|Headers2];
-		false -> [{<<"host">>, [Host, $:, integer_to_binary(Port)]}|Headers2]
+	Headers = case lists:keymember(<<"host">>, 1, Headers0) of
+		true -> Headers3;
+		false when Port =:= 80, not IsSecure -> [{<<"host">>, Host}|Headers3];
+		false when Port =:= 443, IsSecure -> [{<<"host">>, Host}|Headers3];
+		false -> [{<<"host">>, [Host, $:, integer_to_binary(Port)]}|Headers3]
 	end,
-	Transport:send(Socket, cow_http:request(<<"GET">>, Path, 'HTTP/1.1', Headers3)),
+	Transport:send(Socket, cow_http:request(<<"GET">>, Path, 'HTTP/1.1', Headers)),
 	new_stream(State#http_state{connection=keepalive, out=head},
-		{websocket, StreamRef, Key, GunExtensions, [], WsOpts}, <<"GET">>).
+		{websocket, StreamRef, Key, GunExtensions, WsOpts}, Owner, <<"GET">>).
 
-ws_handshake(Buffer, State, Headers, Key, GunExtensions, GunProtocols, Opts) ->
+ws_handshake(Buffer, State, Headers, Key, GunExtensions, Opts) ->
 	%% @todo check upgrade, connection
 	case lists:keyfind(<<"sec-websocket-accept">>, 1, Headers) of
 		false ->
 			close;
 		{_, Accept} ->
 			case cow_ws:encode_key(Key) of
-				Accept -> ws_handshake_extensions(Buffer, State, Headers, GunExtensions, GunProtocols, Opts);
+				Accept -> ws_handshake_extensions(Buffer, State, Headers, GunExtensions, Opts);
 				_ -> close
 			end
 	end.
 
-ws_handshake_extensions(Buffer, State, Headers, GunExtensions, GunProtocols, Opts) ->
+ws_handshake_extensions(Buffer, State, Headers, GunExtensions, Opts) ->
 	case lists:keyfind(<<"sec-websocket-extensions">>, 1, Headers) of
 		false ->
-			ws_handshake_protocols(Buffer, State, Headers, #{}, GunProtocols);
+			ws_handshake_protocols(Buffer, State, Headers, #{}, Opts);
 		{_, ExtHd} ->
 			case ws_validate_extensions(cow_http_hd:parse_sec_websocket_extensions(ExtHd), GunExtensions, #{}, Opts) of
 				close -> close;
-				Extensions -> ws_handshake_protocols(Buffer, State, Headers, Extensions, GunProtocols)
+				Extensions -> ws_handshake_protocols(Buffer, State, Headers, Extensions, Opts)
 			end
 	end.
 
@@ -464,11 +544,23 @@ ws_validate_extensions(_, _, _, _) ->
 	close.
 
 %% @todo Validate protocols.
-ws_handshake_protocols(Buffer, State, Headers, Extensions, _GunProtocols = []) ->
-	Protocols = [],
-	ws_handshake_end(Buffer, State, Headers, Extensions, Protocols).
+ws_handshake_protocols(Buffer, State, Headers, Extensions, Opts) ->
+	case lists:keyfind(<<"sec-websocket-protocol">>, 1, Headers) of
+		false ->
+			ws_handshake_end(Buffer, State, Headers, Extensions,
+				maps:get(default_protocol, Opts, gun_ws_handler), Opts);
+		{_, Proto} ->
+			ProtoOpt = maps:get(protocols, Opts, []),
+			case lists:keyfind(Proto, 1, ProtoOpt) of
+				{_, Handler} ->
+					ws_handshake_end(Buffer, State, Headers, Extensions, Handler, Opts);
+				false ->
+					close
+			end
+	end.
 
-ws_handshake_end(Buffer, #http_state{owner=Owner, socket=Socket, transport=Transport}, Headers, Extensions, Protocols) ->
+ws_handshake_end(Buffer, #http_state{owner=Owner, socket=Socket, transport=Transport},
+		Headers, Extensions, Handler, Opts) ->
 	%% Send ourselves the remaining buffer, if any.
 	_ = case Buffer of
 		<<>> ->
@@ -477,4 +569,4 @@ ws_handshake_end(Buffer, #http_state{owner=Owner, socket=Socket, transport=Trans
 			{OK, _, _} = Transport:messages(),
 			self() ! {OK, Socket, Buffer}
 	end,
-	gun_ws:init(Owner, Socket, Transport, Headers, Extensions, Protocols).
+	gun_ws:init(Owner, Socket, Transport, Headers, Extensions, Handler, Opts).
